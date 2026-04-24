@@ -411,6 +411,29 @@ def verify_one(
     )
 
     gold_out, gold_ms = measure_cuda_ms(gold_kernel.run, *common_args)
+    
+    # DEBUG: Check if gold even has tokens
+    def get_gold_tok_sim(logits, bias, local_offset):
+        scores = torch.sigmoid(logits.to(torch.float32) + bias.to(torch.float32))
+        T = logits.shape[0]
+        count = 0
+        for t in range(T):
+            group_scores = []
+            for g in range(8):
+                g_scores = scores[t, g*32 : (g+1)*32]
+                top2_sum = torch.topk(g_scores, 2).values.sum()
+                group_scores.append(top2_sum.item())
+            group_scores = torch.tensor(group_scores)
+            top4_groups = torch.topk(group_scores, 4).indices.tolist()
+            mask = torch.zeros(256, dtype=torch.bool)
+            for g in top4_groups: mask[g*32 : (g+1)*32] = True
+            token_scores = torch.where(mask, scores[t].cpu(), torch.tensor(-1e20))
+            top8 = torch.topk(token_scores, 8).indices
+            count += ((top8 >= local_offset) & (top8 < local_offset + 32)).sum().item()
+        return count
+
+    gold_sim_tok = get_gold_tok_sim(dynamic_inputs["routing_logits"], static_inputs["routing_bias"], local_expert_offset)
+    # print(f"DEBUG: seq_len={seq_len} gold_sim_tok={gold_sim_tok}")
     gold_out_cpu = copy_output_to_pinned_cpu(gold_out)
     del gold_out
     torch.cuda.empty_cache()
@@ -437,6 +460,7 @@ def verify_one(
         "active_experts": float(dispatch_stats["active_experts"]),
         "k4_backend": dispatch_stats["k4_backend"],
         "k6_backend": dispatch_stats["k6_backend"],
+        "gold_sim_tok": float(gold_sim_tok),
     }
     for tensor in dynamic_inputs.values():
         del tensor
@@ -449,6 +473,7 @@ def format_result(passed: bool, stats: dict[str, float]) -> str:
     return (
         f"[{status}] seq_len={int(stats['seq_len']):5d} "
         f"total_tok={int(stats['total_tok']):6d} "
+        f"gold_sim={int(stats['gold_sim_tok']):6d} "
         f"active_experts={int(stats['active_experts']):2d} "
         f"k4={stats['k4_backend']} "
         f"k6={stats['k6_backend']} "

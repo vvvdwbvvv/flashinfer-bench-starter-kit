@@ -61,7 +61,7 @@ __global__ void router(
 
     // 1. Warp Sort for Group Top-2
     float logit = routing_logits[token * E_GLOBAL + tid];
-    float s_wb = sigmoid(logit) + __bfloat162float(routing_bias[tid]);
+    float s_wb = sigmoid(logit + __bfloat162float(routing_bias[tid]));
 
     rankItem item_arr[1];
     item_arr[0].score = s_wb;

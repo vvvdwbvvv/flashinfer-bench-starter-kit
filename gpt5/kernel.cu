@@ -42,7 +42,7 @@ __global__ void noaux_routing_topk8_kernel(
   // Load and compute s and s_with_bias
   float l = logits[t * NUM_EXPERTS_GLOBAL + e];
   float s = 1.f / (1.f + __expf(-l));
-  float sb = s + bias[e];
+  float sb = 1.f / (1.f + __expf(-(l + bias[e])));
 
   // Compute group top-2 sum within warp
   float v = sb;
