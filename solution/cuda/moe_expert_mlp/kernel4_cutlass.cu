@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <cutlass/cutlass.h>
+#include <cutlass/bfloat16.h>
 #include <cutlass/gemm/device/default_gemm_configuration.h>
 #include <cutlass/gemm/device/gemm_grouped.h>
 #include <cutlass/gemm/kernel/default_gemm_grouped.h>
@@ -15,27 +16,41 @@ namespace kernel4_internal {
 
 constexpr int kCutlassGroupedBatchExperts = 2;
 
+// BF16 Tensor-Op grouped GEMM. The previous implementation used
+// OpClassSimt + float, which routed to regular CUDA cores at FP32 throughput
+// (~10 TFLOPs on H100). Switching to OpClassTensorOp with bfloat16_t
+// inputs and float accumulator unlocks the Tensor Cores (~700+ TFLOPs BF16
+// on H100, much higher on B200) and is what makes CUTLASS competitive with
+// (and faster than) cuBLAS at long sequence lengths.
+using CutlassElementA = cutlass::bfloat16_t;
+using CutlassElementB = cutlass::bfloat16_t;
+using CutlassElementC = float;
+using CutlassElementAccumulator = float;
+
+constexpr int kCutlassAlignA = 8;  // 16-byte vectorized loads for BF16
+constexpr int kCutlassAlignB = 8;
+
 using CutlassGroupedConfig = cutlass::gemm::device::DefaultGemmConfiguration<
-    cutlass::arch::OpClassSimt,
+    cutlass::arch::OpClassTensorOp,
     cutlass::arch::Sm80,
-    float,
-    float,
-    float,
-    float>;
+    CutlassElementA,
+    CutlassElementB,
+    CutlassElementC,
+    CutlassElementAccumulator>;
 
 using CutlassGroupedKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
-    float,
+    CutlassElementA,
     cutlass::layout::RowMajor,
     cutlass::ComplexTransform::kNone,
-    1,
-    float,
+    kCutlassAlignA,
+    CutlassElementB,
     cutlass::layout::ColumnMajor,
     cutlass::ComplexTransform::kNone,
-    1,
-    float,
+    kCutlassAlignB,
+    CutlassElementC,
     cutlass::layout::RowMajor,
-    float,
-    cutlass::arch::OpClassSimt,
+    CutlassElementAccumulator,
+    cutlass::arch::OpClassTensorOp,
     cutlass::arch::Sm80,
     typename CutlassGroupedConfig::ThreadblockShape,
     typename CutlassGroupedConfig::WarpShape,
@@ -51,16 +66,16 @@ using CutlassGroupedStrideB = typename CutlassGroupedGemm::LayoutB::Stride::Long
 using CutlassGroupedStrideC = typename CutlassGroupedGemm::LayoutC::Stride::LongIndex;
 
 struct CutlassScratchView {
-    float* a1_dequant;
-    float* gemm1_up;
-    float* gemm1_gate;
-    float* w1_up;
-    float* w1_gate;
+    CutlassElementA* a1_dequant;       // BF16 dequantized activations
+    CutlassElementC* gemm1_up;         // FP32 GEMM output (kept fp32 to feed swiglu_pack_kernel)
+    CutlassElementC* gemm1_gate;
+    CutlassElementB* w1_up;            // BF16 dequantized weights
+    CutlassElementB* w1_gate;
     cutlass::gemm::GemmCoord* problem_sizes;
-    float** ptr_A;
-    float** ptr_B;
-    float** ptr_C;
-    float** ptr_D;
+    CutlassElementA** ptr_A;
+    CutlassElementB** ptr_B;
+    CutlassElementC** ptr_C;
+    CutlassElementC** ptr_D;
     CutlassGroupedStrideA* lda;
     CutlassGroupedStrideB* ldb;
     CutlassGroupedStrideC* ldc;
@@ -70,16 +85,19 @@ struct CutlassScratchView {
 
 static size_t gemm1_cutlass_aux_bytes(int total_dispatched_tokens) {
     size_t total = 0;
-    total += align_up((size_t)total_dispatched_tokens * HIDDEN_SIZE * sizeof(float));
-    total += align_up((size_t)total_dispatched_tokens * INTERMEDIATE_SIZE * sizeof(float));
-    total += align_up((size_t)total_dispatched_tokens * INTERMEDIATE_SIZE * sizeof(float));
-    total += align_up((size_t)kCutlassGroupedBatchExperts * INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(float));
-    total += align_up((size_t)kCutlassGroupedBatchExperts * INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(float));
+    // BF16 activations (was FP32 before)
+    total += align_up((size_t)total_dispatched_tokens * HIDDEN_SIZE * sizeof(CutlassElementA));
+    // GEMM outputs stay FP32 so swiglu_pack_kernel doesn't need to change.
+    total += align_up((size_t)total_dispatched_tokens * INTERMEDIATE_SIZE * sizeof(CutlassElementC));
+    total += align_up((size_t)total_dispatched_tokens * INTERMEDIATE_SIZE * sizeof(CutlassElementC));
+    // BF16 weights (was FP32 before)
+    total += align_up((size_t)kCutlassGroupedBatchExperts * INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(CutlassElementB));
+    total += align_up((size_t)kCutlassGroupedBatchExperts * INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(CutlassElementB));
     total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(cutlass::gemm::GemmCoord));
-    total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(float*));
-    total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(float*));
-    total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(float*));
-    total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(float*));
+    total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassElementA*));
+    total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassElementB*));
+    total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassElementC*));
+    total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassElementC*));
     total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassGroupedStrideA));
     total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassGroupedStrideB));
     total += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassGroupedStrideC));
@@ -103,35 +121,35 @@ static CutlassScratchView bind_cutlass_scratch(void* storage,
     uintptr_t base = reinterpret_cast<uintptr_t>(storage);
     uintptr_t cursor = align_up(base);
 
-    view.a1_dequant = reinterpret_cast<float*>(cursor);
-    cursor += align_up((size_t)total_dispatched_tokens * HIDDEN_SIZE * sizeof(float));
+    view.a1_dequant = reinterpret_cast<CutlassElementA*>(cursor);
+    cursor += align_up((size_t)total_dispatched_tokens * HIDDEN_SIZE * sizeof(CutlassElementA));
 
-    view.gemm1_up = reinterpret_cast<float*>(cursor);
-    cursor += align_up((size_t)total_dispatched_tokens * INTERMEDIATE_SIZE * sizeof(float));
+    view.gemm1_up = reinterpret_cast<CutlassElementC*>(cursor);
+    cursor += align_up((size_t)total_dispatched_tokens * INTERMEDIATE_SIZE * sizeof(CutlassElementC));
 
-    view.gemm1_gate = reinterpret_cast<float*>(cursor);
-    cursor += align_up((size_t)total_dispatched_tokens * INTERMEDIATE_SIZE * sizeof(float));
+    view.gemm1_gate = reinterpret_cast<CutlassElementC*>(cursor);
+    cursor += align_up((size_t)total_dispatched_tokens * INTERMEDIATE_SIZE * sizeof(CutlassElementC));
 
-    view.w1_up = reinterpret_cast<float*>(cursor);
-    cursor += align_up((size_t)kCutlassGroupedBatchExperts * INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(float));
+    view.w1_up = reinterpret_cast<CutlassElementB*>(cursor);
+    cursor += align_up((size_t)kCutlassGroupedBatchExperts * INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(CutlassElementB));
 
-    view.w1_gate = reinterpret_cast<float*>(cursor);
-    cursor += align_up((size_t)kCutlassGroupedBatchExperts * INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(float));
+    view.w1_gate = reinterpret_cast<CutlassElementB*>(cursor);
+    cursor += align_up((size_t)kCutlassGroupedBatchExperts * INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(CutlassElementB));
 
     view.problem_sizes = reinterpret_cast<cutlass::gemm::GemmCoord*>(cursor);
     cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(cutlass::gemm::GemmCoord));
 
-    view.ptr_A = reinterpret_cast<float**>(cursor);
-    cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(float*));
+    view.ptr_A = reinterpret_cast<CutlassElementA**>(cursor);
+    cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassElementA*));
 
-    view.ptr_B = reinterpret_cast<float**>(cursor);
-    cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(float*));
+    view.ptr_B = reinterpret_cast<CutlassElementB**>(cursor);
+    cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassElementB*));
 
-    view.ptr_C = reinterpret_cast<float**>(cursor);
-    cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(float*));
+    view.ptr_C = reinterpret_cast<CutlassElementC**>(cursor);
+    cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassElementC*));
 
-    view.ptr_D = reinterpret_cast<float**>(cursor);
-    cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(float*));
+    view.ptr_D = reinterpret_cast<CutlassElementC**>(cursor);
+    cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassElementC*));
 
     view.lda = reinterpret_cast<CutlassGroupedStrideA*>(cursor);
     cursor += align_up((size_t)kCutlassGroupedBatchExperts * sizeof(CutlassGroupedStrideA));
@@ -176,12 +194,12 @@ static cudaError_t cutlass_status_to_cuda_error(cutlass::Status status) {
     return cudaErrorUnknown;
 }
 
-static cudaError_t run_cutlass_grouped_float_gemm(
+static cudaError_t run_cutlass_grouped_bf16_gemm(
     CutlassScratchView const& scratch,
     std::vector<cutlass::gemm::GemmCoord> const& host_problem_sizes,
-    std::vector<float*> const& host_ptr_A,
-    std::vector<float*> const& host_ptr_B,
-    std::vector<float*> const& host_ptr_D,
+    std::vector<CutlassElementA*> const& host_ptr_A,
+    std::vector<CutlassElementB*> const& host_ptr_B,
+    std::vector<CutlassElementC*> const& host_ptr_D,
     std::vector<CutlassGroupedStrideA> const& host_lda,
     std::vector<CutlassGroupedStrideB> const& host_ldb,
     std::vector<CutlassGroupedStrideC> const& host_ldd,
@@ -191,7 +209,7 @@ static cudaError_t run_cutlass_grouped_float_gemm(
         return cudaSuccess;
     }
 
-    std::vector<float*> host_ptr_C = host_ptr_D;
+    std::vector<CutlassElementC*> host_ptr_C = host_ptr_D;
     std::vector<CutlassGroupedStrideC> host_ldc = host_ldd;
 
     CUDA_CHECK(cudaMemcpyAsync(
@@ -203,25 +221,25 @@ static cudaError_t run_cutlass_grouped_float_gemm(
     CUDA_CHECK(cudaMemcpyAsync(
         scratch.ptr_A,
         host_ptr_A.data(),
-        problem_count * sizeof(float*),
+        problem_count * sizeof(CutlassElementA*),
         cudaMemcpyHostToDevice,
         stream));
     CUDA_CHECK(cudaMemcpyAsync(
         scratch.ptr_B,
         host_ptr_B.data(),
-        problem_count * sizeof(float*),
+        problem_count * sizeof(CutlassElementB*),
         cudaMemcpyHostToDevice,
         stream));
     CUDA_CHECK(cudaMemcpyAsync(
         scratch.ptr_C,
         host_ptr_C.data(),
-        problem_count * sizeof(float*),
+        problem_count * sizeof(CutlassElementC*),
         cudaMemcpyHostToDevice,
         stream));
     CUDA_CHECK(cudaMemcpyAsync(
         scratch.ptr_D,
         host_ptr_D.data(),
-        problem_count * sizeof(float*),
+        problem_count * sizeof(CutlassElementC*),
         cudaMemcpyHostToDevice,
         stream));
     CUDA_CHECK(cudaMemcpyAsync(
@@ -307,14 +325,14 @@ cudaError_t launch_cutlass_backend(const Kernel4Problem& p,
 
     constexpr int threads = 256;
     int act_total_all = total_tokens * HIDDEN_SIZE;
-    dequant_activations_kernel<<<(act_total_all + threads - 1) / threads, threads, 0, p.stream>>>(
+    dequant_activations_bf16_kernel<<<(act_total_all + threads - 1) / threads, threads, 0, p.stream>>>(
         p.hidden_states,
         p.hidden_states_scale,
         p.token_indices,
         0,
         total_tokens,
         p.seq_len,
-        scratch.a1_dequant
+        reinterpret_cast<__nv_bfloat16*>(scratch.a1_dequant)
     );
     CUDA_CHECK(cudaGetLastError());
 
@@ -333,9 +351,9 @@ cudaError_t launch_cutlass_backend(const Kernel4Problem& p,
     }
 
     std::vector<cutlass::gemm::GemmCoord> problem_sizes;
-    std::vector<float*> ptr_A;
-    std::vector<float*> ptr_B;
-    std::vector<float*> ptr_D;
+    std::vector<CutlassElementA*> ptr_A;
+    std::vector<CutlassElementB*> ptr_B;
+    std::vector<CutlassElementC*> ptr_D;
     std::vector<CutlassGroupedStrideA> lda;
     std::vector<CutlassGroupedStrideB> ldb;
     std::vector<CutlassGroupedStrideC> ldd;
@@ -365,22 +383,22 @@ cudaError_t launch_cutlass_backend(const Kernel4Problem& p,
             const float* w1s_e = p.gemm1_weights_scale +
                 (size_t)info.expert * NUM_GEMM1_OUT_BLOCKS * NUM_HIDDEN_BLOCKS;
 
-            float* w1_up_slot = scratch.w1_up + i * (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE;
-            float* w1_gate_slot = scratch.w1_gate + i * (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE;
+            CutlassElementB* w1_up_slot = scratch.w1_up + i * (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE;
+            CutlassElementB* w1_gate_slot = scratch.w1_gate + i * (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE;
 
-            dequant_gemm1_weight_half_kernel<<<(gemm1_weight_total + threads - 1) / threads, threads, 0, p.stream>>>(
+            dequant_gemm1_weight_half_bf16_kernel<<<(gemm1_weight_total + threads - 1) / threads, threads, 0, p.stream>>>(
                 w1_e,
                 w1s_e,
                 0,
-                w1_up_slot
+                reinterpret_cast<__nv_bfloat16*>(w1_up_slot)
             );
             CUDA_CHECK(cudaGetLastError());
 
-            dequant_gemm1_weight_half_kernel<<<(gemm1_weight_total + threads - 1) / threads, threads, 0, p.stream>>>(
+            dequant_gemm1_weight_half_bf16_kernel<<<(gemm1_weight_total + threads - 1) / threads, threads, 0, p.stream>>>(
                 w1_e,
                 w1s_e,
                 INTERMEDIATE_SIZE,
-                w1_gate_slot
+                reinterpret_cast<__nv_bfloat16*>(w1_gate_slot)
             );
             CUDA_CHECK(cudaGetLastError());
 
@@ -393,7 +411,7 @@ cudaError_t launch_cutlass_backend(const Kernel4Problem& p,
             ldd.push_back(INTERMEDIATE_SIZE);
         }
 
-        CUDA_CHECK(run_cutlass_grouped_float_gemm(
+        CUDA_CHECK(run_cutlass_grouped_bf16_gemm(
             scratch, problem_sizes, ptr_A, ptr_B, ptr_D, lda, ldb, ldd, p.stream));
 
         for (size_t i = 0; i < batch_count; ++i) {
@@ -401,7 +419,7 @@ cudaError_t launch_cutlass_backend(const Kernel4Problem& p,
             ptr_D[i] = scratch.gemm1_gate + (size_t)active_experts[batch_start + i].begin * INTERMEDIATE_SIZE;
         }
 
-        CUDA_CHECK(run_cutlass_grouped_float_gemm(
+        CUDA_CHECK(run_cutlass_grouped_bf16_gemm(
             scratch, problem_sizes, ptr_A, ptr_B, ptr_D, lda, ldb, ldd, p.stream));
 
         for (size_t i = 0; i < batch_count; ++i) {

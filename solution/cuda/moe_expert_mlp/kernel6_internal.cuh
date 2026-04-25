@@ -145,6 +145,11 @@ __global__ void dequant_gemm2_weight_kernel(
     const float*    __restrict__ scales,
     float*          __restrict__ out);
 
+__global__ void dequant_gemm2_weight_bf16_kernel(
+    const fp8_e4m3* __restrict__ weights,
+    const float*    __restrict__ scales,
+    __nv_bfloat16*  __restrict__ out);
+
 size_t cutlass_aux_bytes(int total_dispatched_tokens);
 bool current_device_is_sm86_or_better();
 cudaError_t launch_cutlass_gemm2_combine(const Gemm2Problem& p,
