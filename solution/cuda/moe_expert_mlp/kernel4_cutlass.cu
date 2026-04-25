@@ -14,7 +14,12 @@
 
 namespace kernel4_internal {
 
-constexpr int kCutlassGroupedBatchExperts = 2;
+// Bump from 2 → NUM_LOCAL_EXPERTS so a typical workload (≤32 active experts)
+// fits in a SINGLE grouped GEMM call. This collapses what was previously up to
+// 16 separate launches per GEMM into one, eliminating the per-batch
+// problem-array memcpy + kernel launch overhead. Memory cost: ~938 MB per
+// weight scratch (BF16), bounded and persistent — acceptable on H100.
+constexpr int kCutlassGroupedBatchExperts = NUM_LOCAL_EXPERTS;
 
 // BF16 Tensor-Op grouped GEMM. The previous implementation used
 // OpClassSimt + float, which routed to regular CUDA cores at FP32 throughput
@@ -209,8 +214,11 @@ static cudaError_t run_cutlass_grouped_bf16_gemm(
         return cudaSuccess;
     }
 
-    std::vector<CutlassElementC*> host_ptr_C = host_ptr_D;
-    std::vector<CutlassGroupedStrideC> host_ldc = host_ldd;
+    // Reuse heap allocations across calls — clear() preserves capacity.
+    thread_local std::vector<CutlassElementC*> host_ptr_C;
+    thread_local std::vector<CutlassGroupedStrideC> host_ldc;
+    host_ptr_C.assign(host_ptr_D.begin(), host_ptr_D.end());
+    host_ldc.assign(host_ldd.begin(), host_ldd.end());
 
     CUDA_CHECK(cudaMemcpyAsync(
         scratch.problem_sizes,
@@ -305,11 +313,17 @@ cudaError_t launch_cutlass_backend(const Kernel4Problem& p,
         return cudaErrorInvalidValue;
     }
 
-    std::vector<int> host_offsets(NUM_LOCAL_EXPERTS + 1, 0);
-    CUDA_CHECK(cudaMemcpy(host_offsets.data(),
-                          p.expert_token_offsets,
-                          host_offsets.size() * sizeof(int),
-                          cudaMemcpyDeviceToHost));
+    // Use the caller-provided host mirror when available so we skip the
+    // synchronous cudaMemcpy that would otherwise stall the launch pipeline.
+    int local_host_offsets[NUM_LOCAL_EXPERTS + 1];
+    const int* host_offsets = p.host_expert_token_offsets;
+    if (!host_offsets) {
+        CUDA_CHECK(cudaMemcpy(local_host_offsets,
+                              p.expert_token_offsets,
+                              sizeof(local_host_offsets),
+                              cudaMemcpyDeviceToHost));
+        host_offsets = local_host_offsets;
+    }
 
     CutlassScratchView scratch = bind_cutlass_scratch(
         workspace.cutlass_workspace,
@@ -341,7 +355,11 @@ cudaError_t launch_cutlass_backend(const Kernel4Problem& p,
         int begin;
         int token_count;
     };
-    std::vector<ActiveExpert> active_experts;
+    // thread_local so we keep the heap allocation across calls. clear()
+    // preserves capacity, so after warm-up these never re-allocate.
+    thread_local std::vector<ActiveExpert> active_experts;
+    active_experts.clear();
+    active_experts.reserve(NUM_LOCAL_EXPERTS);
     for (int expert = 0; expert < NUM_LOCAL_EXPERTS; ++expert) {
         int begin = host_offsets[expert];
         int end = host_offsets[expert + 1];
@@ -350,13 +368,13 @@ cudaError_t launch_cutlass_backend(const Kernel4Problem& p,
         }
     }
 
-    std::vector<cutlass::gemm::GemmCoord> problem_sizes;
-    std::vector<CutlassElementA*> ptr_A;
-    std::vector<CutlassElementB*> ptr_B;
-    std::vector<CutlassElementC*> ptr_D;
-    std::vector<CutlassGroupedStrideA> lda;
-    std::vector<CutlassGroupedStrideB> ldb;
-    std::vector<CutlassGroupedStrideC> ldd;
+    thread_local std::vector<cutlass::gemm::GemmCoord> problem_sizes;
+    thread_local std::vector<CutlassElementA*> ptr_A;
+    thread_local std::vector<CutlassElementB*> ptr_B;
+    thread_local std::vector<CutlassElementC*> ptr_D;
+    thread_local std::vector<CutlassGroupedStrideA> lda;
+    thread_local std::vector<CutlassGroupedStrideB> ldb;
+    thread_local std::vector<CutlassGroupedStrideC> ldd;
     problem_sizes.reserve(kCutlassGroupedBatchExperts);
     ptr_A.reserve(kCutlassGroupedBatchExperts);
     ptr_B.reserve(kCutlassGroupedBatchExperts);
@@ -445,6 +463,7 @@ cudaError_t launch_cutlass_backend(const Kernel4Problem& p,
     shared_problem.gemm2_weights = p.gemm2_weights;
     shared_problem.gemm2_weights_scale = p.gemm2_weights_scale;
     shared_problem.expert_token_offsets = p.expert_token_offsets;
+    shared_problem.host_expert_token_offsets = p.host_expert_token_offsets;
     shared_problem.token_indices = p.token_indices;
     shared_problem.local_expert_ids = p.local_expert_ids;
     shared_problem.token_expert_weights = p.token_expert_weights;

@@ -68,6 +68,7 @@ struct Gemm2Problem {
     const fp8_e4m3*      gemm2_weights;
     const float*         gemm2_weights_scale;
     const int*           expert_token_offsets;
+    const int*           host_expert_token_offsets = nullptr; // optional host mirror
     const int*           token_indices;
     const int*           local_expert_ids;
     const float*         token_expert_weights;

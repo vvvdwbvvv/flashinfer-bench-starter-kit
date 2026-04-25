@@ -533,24 +533,20 @@ void integrated_moe_ffi_wrapper(ffi::Tensor routing_logits,
         moe_spec::NUM_LOCAL_EXPERTS);
     finalize_expert_offsets(local_counts_ptr, buffers.expert_token_offsets, moe_spec::NUM_LOCAL_EXPERTS);
 
+    // Always fetch the full offsets array. The latency of cudaMemcpy is
+    // dominated by the API/round-trip cost, not by the 132 bytes payload, so
+    // there's no win from a 4-byte fast path. The full mirror lets every
+    // downstream backend (cutlass kernel4 + cutlass kernel6 + tiled +
+    // fallback) skip its own cudaMemcpy host-sync.
     int total_tok = 0;
     int host_expert_offsets[moe_spec::NUM_LOCAL_EXPERTS + 1];
-    const int* host_expert_offsets_ptr = nullptr;
-    if (k4_cutlass_available() && seq_len >= 1024) {
-        cudaMemcpy(
-            &total_tok,
-            buffers.expert_token_offsets + moe_spec::NUM_LOCAL_EXPERTS,
-            sizeof(int),
-            cudaMemcpyDeviceToHost);
-    } else {
-        cudaMemcpy(
-            host_expert_offsets,
-            buffers.expert_token_offsets,
-            sizeof(host_expert_offsets),
-            cudaMemcpyDeviceToHost);
-        total_tok = host_expert_offsets[moe_spec::NUM_LOCAL_EXPERTS];
-        host_expert_offsets_ptr = host_expert_offsets;
-    }
+    cudaMemcpy(
+        host_expert_offsets,
+        buffers.expert_token_offsets,
+        sizeof(host_expert_offsets),
+        cudaMemcpyDeviceToHost);
+    total_tok = host_expert_offsets[moe_spec::NUM_LOCAL_EXPERTS];
+    const int* host_expert_offsets_ptr = host_expert_offsets;
 
     launch_moe_reindex(
         buffers.token_expert_indices,
@@ -613,6 +609,7 @@ void integrated_moe_ffi_wrapper(ffi::Tensor routing_logits,
     k6_problem.local_expert_offset = local_expert_offset;
     k6_problem.routed_scaling_factor = routed_scaling_factor;
     k6_problem.expert_token_offsets = buffers.expert_token_offsets;
+    k6_problem.host_expert_token_offsets = host_expert_offsets_ptr;
     k6_problem.total_dispatched_tokens = total_tok;
     k6_problem.token_indices = buffers.token_indices;
     k6_problem.local_expert_ids = buffers.local_expert_ids;
